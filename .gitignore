@@ -1,0 +1,28 @@
+# Data (synthetic, but large and regenerable)
+# "data/*" (not "data/") so the .gitkeep exception below can work
+data/*
+!data/.gitkeep
+*.parquet
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# AWS SAM
+.aws-sam/
+
+# Downloaded tools (Synthea jar, ~200 MB)
+tools/
+samconfig.toml
+
+# Secrets
+.env
+*.pem
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

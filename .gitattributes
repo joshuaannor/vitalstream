@@ -1,0 +1,5 @@
+# Store text files with LF line endings so Windows and Linux CI see the same bytes
+* text=auto eol=lf
+
+# PowerShell scripts keep Windows line endings
+*.ps1 text eol=crlf
