@@ -1,0 +1,9 @@
+[project]
+name = "vitalstream"
+version = "0.1.0"
+description = "Serverless FHIR R4 data pipeline on AWS (synthetic data)"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "tests"]
+testpaths = ["tests"]

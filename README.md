@@ -36,11 +36,33 @@ powershell -ExecutionPolicy Bypass -File .\scripts\generate_synthea.ps1   # 100 
 py -3.12 scripts/inspect_bundle.py                                         # readable summary of one bundle
 ```
 
+## Run the pipeline locally
+
+Same code as the Lambda; a local folder stands in for the curated bucket.
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+python -m pytest                     # unit tests (no data or AWS needed)
+python scripts/run_local.py          # bronze JSON -> data/curated/silver (Parquet) + quarantine (JSONL)
+python scripts/check_silver.py       # DuckDB: row counts, unique keys, joins
+```
+
+Silver tables (`silver/<table>/ingest_date=YYYY-MM-DD/*.parquet`):
+
+| Table | Grain | Notes |
+|---|---|---|
+| patients | one per patient | names, identifiers and street address dropped (data minimization) |
+| encounters | one per visit | timestamps converted to UTC |
+| observations | one per measurement | blood pressure split into systolic/diastolic rows sharing `observation_id` |
+| conditions | one per diagnosis | `semantic_tag` separates disorders from findings |
+
+Records that fail a data quality rule go to `quarantine/` with a reason (for example `invalid_timestamp` or `orphan_encounter`); the rest of the bundle still loads. `python scripts/make_bad_bundles.py` creates broken bundles to try it.
+
 ## Status
 
 - [x] Phase 1: Setup
 - [x] Phase 2: Generate synthetic data
-- [ ] Phase 3: Ingest pipeline (bronze to silver)
+- [x] Phase 3: Ingest pipeline (bronze to silver)
 - [ ] Phase 4: SQL analytics (gold)
 - [ ] Phase 5: Security, IaC, CI, polish
 
