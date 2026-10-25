@@ -19,6 +19,7 @@ Python (pandas, pyarrow) · SQL (Athena, DuckDB locally) · AWS S3, Lambda, Glue
 ## Project layout
 
 ```
+scripts/      Data generation and inspection helpers
 src/ingest/   Lambda code: FHIR parsing and data quality checks
 sql/          Athena table definitions and analytics queries
 tests/        pytest unit tests
@@ -26,10 +27,19 @@ data/raw/     Local Synthea output (not committed)
 docs/         Architecture diagram and screenshots
 ```
 
+## Generate the data
+
+Requires Java 17+ and Python 3.12. The script downloads a pinned Synthea release (checksum verified) and produces identical output on every run.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\generate_synthea.ps1   # 100 patients (+ deceased), ~45 s
+py -3.12 scripts/inspect_bundle.py                                         # readable summary of one bundle
+```
+
 ## Status
 
-- [ ] Phase 1: Setup
-- [ ] Phase 2: Generate synthetic data
+- [x] Phase 1: Setup
+- [x] Phase 2: Generate synthetic data
 - [ ] Phase 3: Ingest pipeline (bronze to silver)
 - [ ] Phase 4: SQL analytics (gold)
 - [ ] Phase 5: Security, IaC, CI, polish
