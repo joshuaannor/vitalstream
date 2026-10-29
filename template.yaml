@@ -1,0 +1,301 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  VitalStream: serverless FHIR R4 pipeline on synthetic data.
+  S3 raw (bronze) -> Lambda -> S3 curated (silver Parquet, quarantine) -> Athena (gold).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: vitalstream
+    AllowedPattern: "[a-z0-9-]+"
+    Description: Prefix for resource names (lowercase, used in bucket names)
+  PandasLayerArn:
+    Type: String
+    Default: arn:aws:lambda:us-east-1:336392948345:layer:AWSSDKPandas-Python312-Arm64:32
+    Description: AWS-managed "AWS SDK for pandas" layer (pandas + pyarrow, too big for a plain zip)
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Storage. Every bucket: Block Public Access, SSE-S3, versioning, TLS-only,
+  # ACLs disabled, and lifecycle rules so old versions don't pile up (cost).
+  # ---------------------------------------------------------------------------
+  RawBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      # Name built from parameters (not !Ref) so the Lambda role can reference it
+      # without a circular dependency with the S3 -> Lambda notification.
+      BucketName: !Sub "${ProjectName}-raw-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      VersioningConfiguration: { Status: Enabled }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-versions
+            Status: Enabled
+            NoncurrentVersionExpiration: { NoncurrentDays: 30 }
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 }
+
+  RawBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref RawBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt RawBucket.Arn, !Sub "${RawBucket.Arn}/*"]
+            Condition: { Bool: { "aws:SecureTransport": "false" } }
+
+  CuratedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-curated-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      VersioningConfiguration: { Status: Enabled }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-versions
+            Status: Enabled
+            NoncurrentVersionExpiration: { NoncurrentDays: 30 }
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 }
+          - Id: expire-athena-results
+            Status: Enabled
+            Prefix: athena-results/
+            ExpirationInDays: 7
+
+  CuratedBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CuratedBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt CuratedBucket.Arn, !Sub "${CuratedBucket.Arn}/*"]
+            Condition: { Bool: { "aws:SecureTransport": "false" } }
+
+  # ---------------------------------------------------------------------------
+  # Ingest Lambda with its own least-privilege role
+  # ---------------------------------------------------------------------------
+  IngestLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-ingest"
+      RetentionInDays: 14
+
+  IngestRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: VitalStream ingest Lambda - read raw bundles, write silver/quarantine, write its own logs
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ingest-least-privilege
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadRawBundles
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${ProjectName}-raw-${AWS::AccountId}/fhir/*"
+              - Sid: WriteSilverAndQuarantine
+                Effect: Allow
+                Action: s3:PutObject
+                Resource:
+                  - !Sub "${CuratedBucket.Arn}/silver/*"
+                  - !Sub "${CuratedBucket.Arn}/quarantine/*"
+              - Sid: WriteOwnLogs   # metrics come from these logs (Embedded Metric Format)
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt IngestLogGroup.Arn
+
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-ingest"
+      Description: Flattens FHIR bundles from the raw bucket into silver Parquet tables
+      CodeUri: src/
+      Handler: ingest.handler.lambda_handler
+      Runtime: python3.12
+      Architectures: [arm64]
+      MemorySize: 1024
+      Timeout: 120
+      Role: !GetAtt IngestRole.Arn
+      Layers: [!Ref PandasLayerArn]
+      LoggingConfig:
+        LogGroup: !Ref IngestLogGroup
+        LogFormat: Text
+      Environment:
+        Variables:
+          CURATED_BUCKET: !Ref CuratedBucket
+          METRICS_NAMESPACE: VitalStream
+      Events:
+        BundleUploaded:
+          Type: S3
+          Properties:
+            Bucket: !Ref RawBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - { Name: prefix, Value: fhir/ }
+                  - { Name: suffix, Value: .json }
+
+  # ---------------------------------------------------------------------------
+  # Monitoring (free tier: up to 10 alarms)
+  # ---------------------------------------------------------------------------
+  IngestErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-ingest-errors"
+      AlarmDescription: The ingest Lambda failed at least once in 5 minutes
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref IngestFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  QuarantineAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-records-quarantined"
+      AlarmDescription: At least one record failed a data quality rule in 5 minutes
+      Namespace: VitalStream
+      MetricName: QuarantinedRecords
+      Dimensions: [{ Name: Pipeline, Value: ingest }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  # ---------------------------------------------------------------------------
+  # Athena: results encrypted, auto-deleted after 7 days, 1 GB scan limit per query
+  # ---------------------------------------------------------------------------
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Ref ProjectName
+      Description: VitalStream queries
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: false
+        BytesScannedCutoffPerQuery: 1073741824
+        EngineVersion: { SelectedEngineVersion: Athena engine version 3 }
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${CuratedBucket}/athena-results/"
+          EncryptionConfiguration: { EncryptionOption: SSE_S3 }
+
+  # ---------------------------------------------------------------------------
+  # Audit trail: management events in all regions (the first trail is free)
+  # ---------------------------------------------------------------------------
+  TrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-trail-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      VersioningConfiguration: { Status: Enabled }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-trail-logs
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpiration: { NoncurrentDays: 7 }
+
+  TrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TrailBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt TrailBucket.Arn, !Sub "${TrailBucket.Arn}/*"]
+            Condition: { Bool: { "aws:SecureTransport": "false" } }
+          - Sid: CloudTrailAclCheck
+            Effect: Allow
+            Principal: { Service: cloudtrail.amazonaws.com }
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt TrailBucket.Arn
+            Condition:
+              StringEquals:
+                "aws:SourceArn": !Sub "arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${ProjectName}-trail"
+          - Sid: CloudTrailWrite
+            Effect: Allow
+            Principal: { Service: cloudtrail.amazonaws.com }
+            Action: s3:PutObject
+            Resource: !Sub "${TrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*"
+            Condition:
+              StringEquals:
+                "aws:SourceArn": !Sub "arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${ProjectName}-trail"
+
+  Trail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: TrailBucketPolicy
+    Properties:
+      TrailName: !Sub "${ProjectName}-trail"
+      S3BucketName: !Ref TrailBucket
+      IsLogging: true
+      IsMultiRegionTrail: true
+      IncludeGlobalServiceEvents: true
+      EnableLogFileValidation: true
+
+Outputs:
+  RawBucketName:
+    Description: Upload FHIR bundles to s3://<this>/fhir/
+    Value: !Ref RawBucket
+  CuratedBucketName:
+    Description: Silver Parquet, quarantine and gold tables
+    Value: !Ref CuratedBucket
+  TrailBucketName:
+    Value: !Ref TrailBucket
+  IngestFunctionName:
+    Value: !Ref IngestFunction
+  AthenaWorkGroupName:
+    Value: !Ref AthenaWorkGroup

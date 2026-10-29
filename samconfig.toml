@@ -1,0 +1,15 @@
+# SAM CLI settings, so `sam build` and `sam deploy` need no extra flags. No secrets in here.
+version = 0.1
+
+[default.global.parameters]
+stack_name = "vitalstream"
+region = "us-east-1"
+
+[default.build.parameters]
+cached = true
+
+[default.deploy.parameters]
+capabilities = "CAPABILITY_IAM"
+resolve_s3 = true            # SAM creates a small bucket for uploading the Lambda code
+confirm_changeset = true     # show what will change and ask before applying
+fail_on_empty_changeset = false

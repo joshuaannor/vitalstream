@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: pytest (${{ matrix.pandas }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Local development uses pandas 3; the AWS SDK for pandas Lambda layer may ship 2.x
+        pandas: ["pandas>=3", "pandas<3"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt "${{ matrix.pandas }}"
+      - name: Run tests
+        run: python -m pytest -v
+      - name: Generated Athena SQL is up to date
+        run: |
+          python scripts/render_athena.py
+          git diff --exit-code sql/athena
+
+  lint-template:
+    name: cfn-lint (SAM template)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install cfn-lint
+      - run: cfn-lint template.yaml

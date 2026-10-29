@@ -16,7 +16,6 @@ venv/
 
 # Downloaded tools (Synthea jar, ~200 MB)
 tools/
-samconfig.toml
 
 # Secrets
 .env
