@@ -130,4 +130,4 @@ python scripts/teardown.py    # empties the buckets, drops the Glue databases, d
 - [x] Phase 2: Generate synthetic data
 - [x] Phase 3: Ingest pipeline (bronze to silver)
 - [x] Phase 4: SQL analytics (gold)
-- [ ] Phase 5: Security, IaC, CI, deploy
+- [x] Phase 5: Security, IaC, CI, deploy

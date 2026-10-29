@@ -212,7 +212,10 @@ Resources:
       Description: VitalStream queries
       RecursiveDeleteOption: true
       WorkGroupConfiguration:
-        EnforceWorkGroupConfiguration: true
+        # Not enforced: gold CTAS must write to its own s3://.../gold/<table>/ location.
+        # (Enforcing would push CTAS output under athena-results/, which expires after 7 days.)
+        # The per-query scan limit below applies either way.
+        EnforceWorkGroupConfiguration: false
         PublishCloudWatchMetricsEnabled: false
         BytesScannedCutoffPerQuery: 1073741824
         EngineVersion: { SelectedEngineVersion: Athena engine version 3 }
